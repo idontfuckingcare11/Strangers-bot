@@ -1,0 +1,5 @@
+bot_instance.lock 
+__pycache__/ 
+*.pyc 
+.env 
+backup.txt 

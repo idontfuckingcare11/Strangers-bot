@@ -1,0 +1,7 @@
+app = "discord-strangers-bot"
+primary_region = "sin"
+[build]
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 
