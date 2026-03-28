@@ -1,0 +1,1 @@
+🤖 A Python Discord bot that connects strangers in a server for random conversations. To use, create a bot at discord.com/developers, copy your bot token, and set it as an environment variable: DISCORD_TOKEN=your_token_here
