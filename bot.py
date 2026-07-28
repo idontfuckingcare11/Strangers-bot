@@ -289,11 +289,11 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
             for i in range(0, len(user_list), 50):
                 mentions = " ".join(f"<@{uid}>" for uid in user_list[i:i+50])
                 await channel.send(
-                    f"⚔️ **{event_name}** time is UP! Calling all participants:\n{mentions}\nPrepare your gear! ⚔️",
+                    f"{mentions}\nGear up, stay online, and get ready! ⚔️",
                     allowed_mentions=allowed
                 )
         else:
-            await channel.send(f"⚔️ **{event_name}** time is UP! Prepare your gear! ⚔️")
+            await channel.send("Gear up, stay online, and get ready! ⚔️")
 
     asyncio.create_task(_ping())
 
