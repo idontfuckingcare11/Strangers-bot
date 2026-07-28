@@ -150,8 +150,9 @@ def has_creator_role():
     return commands.check(predicate)
 
 
-TIMESTAMP_RE  = re.compile(r"<t:(\d+)(?::[dDtTfFR])?>")
+TIMESTAMP_RE   = re.compile(r"<t:(\d+)(?::[dDtTfFR])?>")
 TIME_SIMPLE_RE = re.compile(r"\b(?:(?:at|@)\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
+DURATION_RE    = re.compile(r"\b(?:in\s+)?(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours))?\s*(?:(\d+)\s*(?:m|min|mins|minute|minutes))?\b", re.IGNORECASE)
 
 
 def _extract_unix(text: str) -> int | None:
@@ -176,6 +177,26 @@ def _infer_local_time_unix(text: str) -> int | None:
     if c <= now:
         c += dt.timedelta(days=1)
     return int(c.astimezone(dt.timezone.utc).timestamp())
+
+
+def _parse_event_time_unix(text: str) -> int | None:
+    if not text:
+        return None
+
+    ts = _extract_unix(text)
+    if ts:
+        return ts
+
+    m_dur = DURATION_RE.search(text)
+    if m_dur and (m_dur.group(1) or m_dur.group(2)):
+        hours = float(m_dur.group(1) or 0)
+        minutes = float(m_dur.group(2) or 0)
+        total_sec = hours * 3600 + minutes * 60
+        if total_sec > 0:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            return int((now_utc + dt.timedelta(seconds=total_sec)).timestamp())
+
+    return _infer_local_time_unix(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,15 +264,36 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
     async def _ping():
         if delay > 0:
             await asyncio.sleep(delay)
-        state    = lineups.get(message_id, {})
-        join_ids = list(state.get("join", set()))
-        allowed  = nextcord.AllowedMentions(everyone=False, roles=False, users=True)
-        if join_ids:
-            for i in range(0, len(join_ids), 50):
-                mentions = " ".join(f"<@{uid}>" for uid in join_ids[i:i+50])
-                await channel.send(f"{mentions} prepare your gear — **{event_name}** has started!", allowed_mentions=allowed)
+        
+        join_ids: set[int] = set()
+        
+        state = lineups.get(message_id, {})
+        join_ids.update(state.get("join", set()))
+
+        try:
+            msg = await channel.fetch_message(message_id)
+            for reaction in msg.reactions:
+                if str(reaction.emoji) == "✅":
+                    async for user in reaction.users():
+                        if not user.bot:
+                            join_ids.add(user.id)
+                elif str(reaction.emoji) == "❌":
+                    async for user in reaction.users():
+                        join_ids.discard(user.id)
+        except Exception as e:
+            print(f"[PING] Could not fetch live reactions for {message_id}: {e}", flush=True)
+
+        user_list = list(join_ids)
+        allowed = nextcord.AllowedMentions(everyone=False, roles=False, users=True)
+        if user_list:
+            for i in range(0, len(user_list), 50):
+                mentions = " ".join(f"<@{uid}>" for uid in user_list[i:i+50])
+                await channel.send(
+                    f"⚔️ **{event_name}** time is UP! Calling all participants:\n{mentions}\nPrepare your gear! ⚔️",
+                    allowed_mentions=allowed
+                )
         else:
-            await channel.send(f"**{event_name}** has started! Prepare your gear.")
+            await channel.send(f"⚔️ **{event_name}** time is UP! Prepare your gear! ⚔️")
 
     asyncio.create_task(_ping())
 
@@ -318,7 +360,8 @@ async def _scheduler():
                         tag     = f"<t:{ts}:R>"
                         msg_txt = ev["message"].format(time_tag=tag)
                         if ev.get("lineup"):
-                            await _post_lineup(channel, channel.guild, f"{ev['name']} Line-Up", msg_txt, ping=True)
+                            msg = await _post_lineup(channel, channel.guild, f"{ev['name']} Line-Up", msg_txt, ping=True)
+                            await _schedule_start_ping(msg.id, channel, ts, ev["name"])
                         else:
                             await channel.send(msg_txt, allowed_mentions=allowed)
                         print(f"[SCHED] Pre-announcement → {ev['name']}", flush=True)
@@ -499,6 +542,58 @@ async def setuplineuppanel_cmd(ctx):
 # Lineup panel (persistent buttons)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Lineup panel (persistent buttons) & modal
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CreateLineupModal(nextcord.ui.Modal):
+    def __init__(self, lineup_title: str):
+        super().__init__(title=f"Create {lineup_title}")
+        self.lineup_title = lineup_title
+        self.text_input = nextcord.ui.TextInput(
+            label="Extra Description / Note",
+            style=nextcord.TextInputStyle.paragraph,
+            required=False,
+            placeholder="e.g. Guild Siege starting soon!"
+        )
+        self.time_input = nextcord.ui.TextInput(
+            label="Event Time or Duration (e.g. 9:00 PM, 30m, 1h)",
+            style=nextcord.TextInputStyle.short,
+            required=False,
+            placeholder="e.g. 30m or 9:00 PM (leave blank if no timer)"
+        )
+        self.ping_input = nextcord.ui.TextInput(
+            label='Ping @everyone? (type "true" to ping)',
+            style=nextcord.TextInputStyle.short,
+            required=False,
+            placeholder="false"
+        )
+        self.add_item(self.text_input)
+        self.add_item(self.time_input)
+        self.add_item(self.ping_input)
+
+    async def callback(self, interaction: nextcord.Interaction):
+        member = interaction.user if isinstance(interaction.user, nextcord.Member) \
+                 else interaction.guild.get_member(interaction.user.id)
+        if not member or not _has_creator(member):
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
+            return
+
+        extra_text = (self.text_input.value or "").strip()
+        time_str   = (self.time_input.value or "").strip()
+        do_ping    = (self.ping_input.value or "").strip().lower() in ("true", "yes", "y", "1")
+
+        display_text = extra_text
+        ts = _parse_event_time_unix(time_str) or _parse_event_time_unix(extra_text)
+        if ts and not TIMESTAMP_RE.search(extra_text):
+            time_tag = f"<t:{ts}:F> (<t:{ts}:R>)"
+            display_text = f"{display_text}\n⏰ Event Time: {time_tag}" if display_text else f"⏰ Event Time: {time_tag}"
+
+        msg = await _post_lineup_interaction(interaction, self.lineup_title, display_text, ping=do_ping)
+        if ts:
+            await _schedule_start_ping(msg.id, interaction.channel, ts, self.lineup_title)
+
+
 class LineupPanel(nextcord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -515,13 +610,13 @@ class LineupPanel(nextcord.ui.View):
     async def btn_siege(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        await _post_lineup_interaction(interaction, "Siege Line-Up")
+        await interaction.response.send_modal(CreateLineupModal("Siege Line-Up"))
 
     @nextcord.ui.button(label="Create Secret Room Line-Up", style=nextcord.ButtonStyle.primary, custom_id="lineup_secret")
     async def btn_secret(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        await _post_lineup_interaction(interaction, "Secret Room Line-Up")
+        await interaction.response.send_modal(CreateLineupModal("Secret Room Line-Up"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -620,7 +715,7 @@ try:
     @bot.slash_command(name="siegelineup", description="Create a siege participation lineup", guild_ids=[GUILD_ID])
     async def siegelineup_slash(
         interaction: nextcord.Interaction,
-        text: str = SlashOption(required=False, description="Extra text or siege time"),
+        text: str = SlashOption(required=False, description="Extra text or siege time (e.g. 9:00 PM, 30m, 1h)"),
         ping_everyone: bool = SlashOption(required=False, default=False),
     ):
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
@@ -628,8 +723,13 @@ try:
         if not member or not _has_creator(member):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        msg = await _post_lineup_interaction(interaction, "Siege Line-Up", text or "", ping=ping_everyone)
-        ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
+        ts = _parse_event_time_unix(text or "")
+        display_text = text or ""
+        if ts and not TIMESTAMP_RE.search(text or ""):
+            time_tag = f"<t:{ts}:F> (<t:{ts}:R>)"
+            display_text = f"{text}\n⏰ Event Time: {time_tag}" if text else f"⏰ Event Time: {time_tag}"
+
+        msg = await _post_lineup_interaction(interaction, "Siege Line-Up", display_text, ping=ping_everyone)
         if ts:
             await _schedule_start_ping(msg.id, interaction.channel, ts, "Guild Siege")
 
@@ -637,7 +737,7 @@ try:
     @bot.slash_command(name="secretroomlineup", description="Create a secret room lineup", guild_ids=[GUILD_ID])
     async def secretroomlineup_slash(
         interaction: nextcord.Interaction,
-        text: str = SlashOption(required=False, description="Extra text or time"),
+        text: str = SlashOption(required=False, description="Extra text or time (e.g. 9:00 PM, 30m, 1h)"),
         ping_everyone: bool = SlashOption(required=False, default=False),
     ):
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
@@ -645,8 +745,13 @@ try:
         if not member or not _has_creator(member):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        msg = await _post_lineup_interaction(interaction, "Secret Room Line-Up", text or "", ping=ping_everyone)
-        ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
+        ts = _parse_event_time_unix(text or "")
+        display_text = text or ""
+        if ts and not TIMESTAMP_RE.search(text or ""):
+            time_tag = f"<t:{ts}:F> (<t:{ts}:R>)"
+            display_text = f"{text}\n⏰ Event Time: {time_tag}" if text else f"⏰ Event Time: {time_tag}"
+
+        msg = await _post_lineup_interaction(interaction, "Secret Room Line-Up", display_text, ping=ping_everyone)
         if ts:
             await _schedule_start_ping(msg.id, interaction.channel, ts, "Secret Room")
 
