@@ -218,6 +218,23 @@ async def _post_lineup(channel, guild, title: str, text: str = "", ping: bool = 
     return msg
 
 
+async def _post_lineup_interaction(interaction: nextcord.Interaction, title: str, text: str = "", ping: bool = False) -> nextcord.Message:
+    join_ids: set[int] = set()
+    no_ids:   set[int] = set()
+    embed   = _lineup_embed(title, interaction.guild, join_ids, no_ids, text)
+    allowed = nextcord.AllowedMentions(everyone=ping, roles=True, users=True)
+    content = "@everyone" if ping else None
+    await interaction.response.send_message(content=content, embed=embed, allowed_mentions=allowed)
+    msg     = await interaction.original_message()
+    try:
+        await msg.add_reaction("✅")
+        await msg.add_reaction("❌")
+    except Exception:
+        pass
+    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text}
+    return msg
+
+
 async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_name: str):
     now   = dt.datetime.now(dt.timezone.utc)
     when  = dt.datetime.fromtimestamp(when_unix, tz=dt.timezone.utc)
@@ -498,17 +515,13 @@ class LineupPanel(nextcord.ui.View):
     async def btn_siege(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        await interaction.response.defer(ephemeral=True)
-        await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up")
-        await interaction.followup.send("✅ Siege line-up posted.", ephemeral=True)
+        await _post_lineup_interaction(interaction, "Siege Line-Up")
 
     @nextcord.ui.button(label="Create Secret Room Line-Up", style=nextcord.ButtonStyle.primary, custom_id="lineup_secret")
     async def btn_secret(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        await interaction.response.defer(ephemeral=True)
-        await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up")
-        await interaction.followup.send("✅ Secret room line-up posted.", ephemeral=True)
+        await _post_lineup_interaction(interaction, "Secret Room Line-Up")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -615,15 +628,10 @@ try:
         if not member or not _has_creator(member):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        msg = await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up", text or "", ping=ping_everyone)
+        msg = await _post_lineup_interaction(interaction, "Siege Line-Up", text or "", ping=ping_everyone)
         ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
         if ts:
             await _schedule_start_ping(msg.id, interaction.channel, ts, "Guild Siege")
-        try:
-            await interaction.followup.send("✅ Siege line-up posted.", ephemeral=True)
-        except Exception:
-            pass
 
     # ── /secretroomlineup ─────────────────────────────────────────────────────
     @bot.slash_command(name="secretroomlineup", description="Create a secret room lineup", guild_ids=[GUILD_ID])
@@ -637,15 +645,10 @@ try:
         if not member or not _has_creator(member):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        msg = await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up", text or "", ping=ping_everyone)
+        msg = await _post_lineup_interaction(interaction, "Secret Room Line-Up", text or "", ping=ping_everyone)
         ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
         if ts:
             await _schedule_start_ping(msg.id, interaction.channel, ts, "Secret Room")
-        try:
-            await interaction.followup.send("✅ Secret Room line-up posted.", ephemeral=True)
-        except Exception:
-            pass
 
     # ── /status ───────────────────────────────────────────────────────────────
     @bot.slash_command(name="status", description="Show bot status", guild_ids=[GUILD_ID])
@@ -671,7 +674,6 @@ try:
         interaction: nextcord.Interaction,
         boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
     ):
-        await interaction.response.defer(ephemeral=True)
         now      = dt.datetime.now(dt.timezone.utc)
         end_unix = int((now + dt.timedelta(hours=2)).timestamp())
         raw      = (boss or "").strip().lower()
@@ -690,12 +692,9 @@ try:
         msg_body = (f"{barrier}\nHey team, Next World Boss (**{display}**) at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}"
                     if display else
                     f"{barrier}\nHey team, Next World Boss at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}")
-        try:
-            sent = await interaction.channel.send(msg_body,
-                       allowed_mentions=nextcord.AllowedMentions(everyone=False, roles=True, users=True))
-        except Exception:
-            await interaction.followup.send("❌ Failed to post.", ephemeral=True)
-            return
+        
+        await interaction.response.send_message(msg_body, allowed_mentions=nextcord.AllowedMentions(everyone=False, roles=True, users=True))
+        sent = await interaction.original_message()
 
         async def _end(start_id: int):
             try:
@@ -723,10 +722,6 @@ try:
                 print(f"[WB] Failed to send announcement: {e}", flush=True)
 
         asyncio.create_task(_end(sent.id))
-        try:
-            await interaction.followup.send("✅ World Boss timer set.", ephemeral=True)
-        except Exception:
-            pass
 
     # ── /cmds ─────────────────────────────────────────────────────────────────
     @bot.slash_command(name="cmds", description="List active slash commands", guild_ids=[GUILD_ID])
@@ -747,6 +742,22 @@ try:
             return
         lines = [f"/{n}" + (f" — {d}" if d else "") for n, d in sorted(names.items())]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ── /reloadcmds ───────────────────────────────────────────────────────────
+    @bot.slash_command(name="reloadcmds", description="Re-sync slash commands for this server", guild_ids=[GUILD_ID])
+    async def reloadcmds_slash(interaction: nextcord.Interaction):
+        member = interaction.user if isinstance(interaction.user, nextcord.Member) \
+                 else interaction.guild.get_member(interaction.user.id)
+        if not member or not _has_creator(member):
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            synced = await bot.sync_application_commands(guild_id=interaction.guild.id)
+            count = len(synced) if hasattr(synced, "__len__") else 0
+            await interaction.followup.send(f"✅ Synced {count} slash command(s).", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to sync: {e}", ephemeral=True)
 
 except Exception as _e:
     print(f"[WARN] Slash command setup failed: {_e}", flush=True)
