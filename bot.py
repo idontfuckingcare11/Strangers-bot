@@ -11,6 +11,7 @@ import random
 import re
 import datetime as dt
 from zoneinfo import ZoneInfo
+from aiohttp import web
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -58,7 +59,7 @@ CRYSTAL_MINES_CHANNEL_ID = int(os.getenv("CRYSTAL_MINES_CHANNEL_ID",  "147151589
 NEXUS_CHANNEL_ID         = int(os.getenv("NEXUS_CHANNEL_ID",          "1471515919359672534"))
 SECRET_ROOM_EVENT_CH_ID  = int(os.getenv("SECRET_ROOM_EVENT_CHANNEL_ID", "1255630379977670657"))
 
-PH_TZ     = ZoneInfo("Asia/Manila")
+PH_TZ    = ZoneInfo("Asia/Manila")
 FFA_TIMES = [11, 14, 17, 20, 23, 2, 5, 8]
 
 # ── Event schedules ───────────────────────────────────────────────────────────
@@ -108,107 +109,6 @@ BOT_STATUS: dict = {"status": "initializing", "last_error": None, "last_error_ti
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Cloudflare / rate-limit detection
-# ═══════════════════════════════════════════════════════════════════════════════
-
-CF_KEYWORDS = frozenset([
-    "too many requests", "access denied", "cloudflare",
-    "error 1015", "rate limited", "429", "<!doctype html>", "<html"
-])
-
-
-def _is_cloudflare(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(kw in msg for kw in CF_KEYWORDS)
-
-
-def _is_rate_limit(exc: Exception) -> bool:
-    if _is_cloudflare(exc):
-        return True
-    msg = str(exc).lower()
-    return "429" in msg or "rate limit" in msg or "ratelimit" in msg
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Safe interaction helpers  (never crash on 429)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def _safe_defer(interaction: nextcord.Interaction, ephemeral: bool = True) -> bool:
-    try:
-        await interaction.response.defer(ephemeral=ephemeral)
-        return True
-    except nextcord.errors.HTTPException as e:
-        print(f"[WARN] defer() failed: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[WARN] defer() unexpected: {e}", flush=True)
-        return False
-
-
-async def _safe_respond(
-    interaction: nextcord.Interaction,
-    content: str = None,
-    ephemeral: bool = True,
-    embed=None,
-) -> bool:
-    try:
-        kwargs = {"ephemeral": ephemeral}
-        if content:
-            kwargs["content"] = content
-        if embed:
-            kwargs["embed"] = embed
-        await interaction.response.send_message(**kwargs)
-        return True
-    except nextcord.errors.HTTPException as e:
-        print(f"[WARN] send_message() failed: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[WARN] send_message() unexpected: {e}", flush=True)
-        return False
-
-
-async def _safe_followup(
-    interaction: nextcord.Interaction,
-    content: str = None,
-    ephemeral: bool = True,
-    embed=None,
-) -> bool:
-    try:
-        kwargs = {"ephemeral": ephemeral}
-        if content:
-            kwargs["content"] = content
-        if embed:
-            kwargs["embed"] = embed
-        await interaction.followup.send(**kwargs)
-        return True
-    except nextcord.errors.HTTPException as e:
-        print(f"[WARN] followup() failed: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[WARN] followup() unexpected: {e}", flush=True)
-        return False
-
-
-async def _safe_send_modal(interaction: nextcord.Interaction, modal) -> bool:
-    try:
-        await interaction.response.send_modal(modal)
-        return True
-    except nextcord.errors.HTTPException as e:
-        print(f"[WARN] send_modal() failed: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[WARN] send_modal() unexpected: {e}", flush=True)
-        return False
-
-
-async def _safe_delete_original(interaction: nextcord.Interaction):
-    try:
-        await interaction.delete_original_message()
-    except Exception:
-        pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -250,7 +150,7 @@ def has_creator_role():
     return commands.check(predicate)
 
 
-TIMESTAMP_RE   = re.compile(r"<t:(\d+)(?::[dDtTfFR])?>")
+TIMESTAMP_RE  = re.compile(r"<t:(\d+)(?::[dDtTfFR])?>")
 TIME_SIMPLE_RE = re.compile(r"\b(?:(?:at|@)\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
 
 
@@ -296,8 +196,8 @@ def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set,
             parts.append(f"• {m.display_name if m else f'<@{uid}>'}")
         return "\n".join(parts)
 
-    embed.add_field(name=f"✅ Will Join ({len(join_ids)})",  value=names(join_ids), inline=True)
-    embed.add_field(name=f"❌ Not Joining ({len(no_ids)})", value=names(no_ids),   inline=True)
+    embed.add_field(name=f"✅ Will Join ({len(join_ids)})",   value=names(join_ids), inline=True)
+    embed.add_field(name=f"❌ Not Joining ({len(no_ids)})", value=names(no_ids),  inline=True)
     embed.set_footer(text="React ✅ or ❌ to update your participation")
     return embed
 
@@ -329,18 +229,12 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
         state    = lineups.get(message_id, {})
         join_ids = list(state.get("join", set()))
         allowed  = nextcord.AllowedMentions(everyone=False, roles=False, users=True)
-        try:
-            if join_ids:
-                for i in range(0, len(join_ids), 50):
-                    mentions = " ".join(f"<@{uid}>" for uid in join_ids[i:i+50])
-                    await channel.send(
-                        f"{mentions} prepare your gear — **{event_name}** has started!",
-                        allowed_mentions=allowed
-                    )
-            else:
-                await channel.send(f"**{event_name}** has started! Prepare your gear.")
-        except Exception as e:
-            print(f"[WARN] _ping send failed: {e}", flush=True)
+        if join_ids:
+            for i in range(0, len(join_ids), 50):
+                mentions = " ".join(f"<@{uid}>" for uid in join_ids[i:i+50])
+                await channel.send(f"{mentions} prepare your gear — **{event_name}** has started!", allowed_mentions=allowed)
+        else:
+            await channel.send(f"**{event_name}** has started! Prepare your gear.")
 
     asyncio.create_task(_ping())
 
@@ -352,13 +246,14 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
 async def _scheduler():
     while True:
         try:
-            now_local   = dt.datetime.now(PH_TZ)
-            next_action = None
-            min_delay   = float("inf")
+            now_local    = dt.datetime.now(PH_TZ)
+            next_action  = None
+            min_delay    = float("inf")
 
             for ev in EVENT_SCHEDULES:
                 offset = ev.get("offset_mins", 5)
                 for hour, minute, weekday in ev["times"]:
+                    # Calculate next occurrence of this event
                     cand = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
                     if weekday is not None:
                         days = weekday - cand.weekday()
@@ -368,12 +263,14 @@ async def _scheduler():
                     elif cand <= now_local:
                         cand += dt.timedelta(days=1)
 
+                    # Pre-announcement
                     ann_time  = cand - dt.timedelta(minutes=offset)
                     delay_ann = (ann_time - now_local).total_seconds()
                     if 0 < delay_ann < min_delay:
                         min_delay   = delay_ann
                         next_action = {"type": "pre", "event": ev, "event_time": cand}
 
+                    # At-start announcement
                     if ev.get("at_start"):
                         delay_start = (cand - now_local).total_seconds()
                         if 0 < delay_start < min_delay:
@@ -409,10 +306,7 @@ async def _scheduler():
                             await channel.send(msg_txt, allowed_mentions=allowed)
                         print(f"[SCHED] Pre-announcement → {ev['name']}", flush=True)
                     elif next_action["type"] == "start":
-                        await channel.send(
-                            ev.get("start_message", f"**{ev['name']}** has started!"),
-                            allowed_mentions=allowed
-                        )
+                        await channel.send(ev.get("start_message", f"**{ev['name']}** has started!"), allowed_mentions=allowed)
                         print(f"[SCHED] Start announcement → {ev['name']}", flush=True)
                 except Exception as e:
                     print(f"[SCHED] Error for {ev['name']}: {e}", flush=True)
@@ -538,9 +432,9 @@ async def ping_cmd(ctx):
 @commands.guild_only()
 async def status_cmd(ctx):
     embed = nextcord.Embed(title="Bot Status", color=0x3498DB)
-    embed.add_field(name="Uptime",  value=_format_uptime(),                inline=True)
+    embed.add_field(name="Uptime",  value=_format_uptime(),             inline=True)
     embed.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms", inline=True)
-    embed.add_field(name="Servers", value=str(len(bot.guilds)),             inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)),          inline=True)
     await ctx.send(embed=embed)
 
 
@@ -549,10 +443,8 @@ async def status_cmd(ctx):
 async def nextffa_cmd(ctx):
     nt   = _next_ffa_local()
     unix = int(nt.astimezone(dt.timezone.utc).timestamp())
-    await ctx.send(
-        f"Next FFA: <t:{unix}:F> (<t:{unix}:R>) Asia/Manila",
-        allowed_mentions=nextcord.AllowedMentions.none()
-    )
+    await ctx.send(f"Next FFA: <t:{unix}:F> (<t:{unix}:R>) Asia/Manila",
+                   allowed_mentions=nextcord.AllowedMentions.none())
 
 
 @bot.command(name="reloadcmds")
@@ -598,33 +490,25 @@ class LineupPanel(nextcord.ui.View):
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                  else interaction.guild.get_member(interaction.user.id)
         if not member or not _has_creator(member):
-            await _safe_respond(interaction, "❌ You don't have permission.")
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
             return False
         return True
 
-    @nextcord.ui.button(label="Create Siege Line-Up", style=nextcord.ButtonStyle.success, custom_id="lineup_siege")
+    @nextcord.ui.button(label="Create Siege Line-Up",       style=nextcord.ButtonStyle.success, custom_id="lineup_siege")
     async def btn_siege(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
-        try:
-            await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up")
-            await _safe_followup(interaction, "✅ Siege line-up posted.")
-        except Exception as e:
-            print(f"[WARN] btn_siege: {e}", flush=True)
+        await interaction.response.defer(ephemeral=True)
+        await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up")
+        await interaction.followup.send("✅ Siege line-up posted.", ephemeral=True)
 
     @nextcord.ui.button(label="Create Secret Room Line-Up", style=nextcord.ButtonStyle.primary, custom_id="lineup_secret")
     async def btn_secret(self, _btn, interaction: nextcord.Interaction):
         if not await self._check(interaction):
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
-        try:
-            await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up")
-            await _safe_followup(interaction, "✅ Secret room line-up posted.")
-        except Exception as e:
-            print(f"[WARN] btn_secret: {e}", flush=True)
+        await interaction.response.defer(ephemeral=True)
+        await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up")
+        await interaction.followup.send("✅ Secret room line-up posted.", ephemeral=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,6 +518,7 @@ class LineupPanel(nextcord.ui.View):
 try:
     from nextcord import SlashOption
 
+    # ── Modal for multi-line messages ─────────────────────────────────────────
     class PostMessageModal(nextcord.ui.Modal):
         def __init__(self):
             super().__init__(title="Post Message")
@@ -653,19 +538,19 @@ try:
             member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                      else interaction.guild.get_member(interaction.user.id)
             if not member or not _has_creator(member):
-                await _safe_respond(interaction, "❌ No permission.")
+                await interaction.response.send_message("❌ No permission.", ephemeral=True)
                 return
-            text    = (self.text.value or "").strip()
-            do_ping = (self.ping.value or "").strip().lower() in ("true", "yes", "y", "1") \
-                      or text.startswith("@everyone")
+            text = (self.text.value or "").strip()
+            do_ping = (self.ping.value or "").strip().lower() in ("true","yes","y","1") or text.startswith("@everyone")
             allowed = nextcord.AllowedMentions(everyone=do_ping, roles=True, users=True)
             content = ("@everyone " + text) if (do_ping and not text.startswith("@everyone")) else text
             try:
                 await interaction.channel.send(content, allowed_mentions=allowed)
-                await _safe_respond(interaction, "✅ Posted.")
+                await interaction.response.send_message("✅ Posted.", ephemeral=True)
             except Exception:
-                await _safe_respond(interaction, "❌ Failed to post. Check channel permissions.")
+                await interaction.response.send_message("❌ Failed to post. Check channel permissions.", ephemeral=True)
 
+    # ── /postmessage ──────────────────────────────────────────────────────────
     @bot.slash_command(name="postmessage", description="Post a message in the current channel", guild_ids=[GUILD_ID])
     async def postmessage_slash(
         interaction: nextcord.Interaction,
@@ -675,13 +560,12 @@ try:
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                  else interaction.guild.get_member(interaction.user.id)
         if not member or not _has_creator(member):
-            await _safe_respond(interaction, "❌ No permission.")
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
         if not (text or "").strip():
-            await _safe_send_modal(interaction, PostMessageModal())
+            await interaction.response.send_modal(PostMessageModal())
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
+        await interaction.response.defer(ephemeral=True)
         text    = (text or "").replace("\\n", "\n")
         do_ping = ping_everyone or text.startswith("@everyone")
         allowed = nextcord.AllowedMentions(everyone=do_ping, roles=True, users=True)
@@ -689,10 +573,14 @@ try:
         try:
             await interaction.channel.send(content, allowed_mentions=allowed)
         except Exception:
-            await _safe_followup(interaction, "❌ Failed. Check permissions.")
+            await interaction.followup.send("❌ Failed. Check permissions.", ephemeral=True)
             return
-        await _safe_delete_original(interaction)
+        try:
+            await interaction.followup.send("✅ Message posted.", ephemeral=True)
+        except Exception:
+            pass
 
+    # ── /delete ───────────────────────────────────────────────────────────────
     @bot.slash_command(name="delete", description="Delete recent messages (1–100)", guild_ids=[GUILD_ID])
     async def delete_slash(
         interaction: nextcord.Interaction,
@@ -701,21 +589,21 @@ try:
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                  else interaction.guild.get_member(interaction.user.id)
         if not member or not _has_creator(member):
-            await _safe_respond(interaction, "❌ No permission.")
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
         count = max(1, min(count, 100))
         perms = interaction.channel.permissions_for(interaction.guild.me)
         if not (perms.manage_messages and perms.read_message_history):
-            await _safe_respond(interaction, "❌ I need Manage Messages + Read Message History.")
+            await interaction.response.send_message("❌ I need Manage Messages + Read Message History.", ephemeral=True)
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
+        await interaction.response.defer(ephemeral=True)
         try:
             deleted = await interaction.channel.purge(limit=count, check=lambda m: not m.pinned)
-            await _safe_followup(interaction, f"🧹 Deleted {len(deleted)} message(s).")
+            await interaction.followup.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True)
         except Exception as e:
-            await _safe_followup(interaction, f"❌ Failed: {e}")
+            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
+    # ── /siegelineup ──────────────────────────────────────────────────────────
     @bot.slash_command(name="siegelineup", description="Create a siege participation lineup", guild_ids=[GUILD_ID])
     async def siegelineup_slash(
         interaction: nextcord.Interaction,
@@ -725,19 +613,19 @@ try:
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                  else interaction.guild.get_member(interaction.user.id)
         if not member or not _has_creator(member):
-            await _safe_respond(interaction, "❌ No permission.")
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
+        await interaction.response.defer(ephemeral=True)
+        msg = await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up", text or "", ping=ping_everyone)
+        ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
+        if ts:
+            await _schedule_start_ping(msg.id, interaction.channel, ts, "Guild Siege")
         try:
-            msg = await _post_lineup(interaction.channel, interaction.guild, "Siege Line-Up", text or "", ping=ping_everyone)
-            ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
-            if ts:
-                await _schedule_start_ping(msg.id, interaction.channel, ts, "Guild Siege")
-        except Exception as e:
-            print(f"[WARN] siegelineup: {e}", flush=True)
-        await _safe_delete_original(interaction)
+            await interaction.followup.send("✅ Siege line-up posted.", ephemeral=True)
+        except Exception:
+            pass
 
+    # ── /secretroomlineup ─────────────────────────────────────────────────────
     @bot.slash_command(name="secretroomlineup", description="Create a secret room lineup", guild_ids=[GUILD_ID])
     async def secretroomlineup_slash(
         interaction: nextcord.Interaction,
@@ -747,40 +635,43 @@ try:
         member = interaction.user if isinstance(interaction.user, nextcord.Member) \
                  else interaction.guild.get_member(interaction.user.id)
         if not member or not _has_creator(member):
-            await _safe_respond(interaction, "❌ No permission.")
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
+        await interaction.response.defer(ephemeral=True)
+        msg = await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up", text or "", ping=ping_everyone)
+        ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
+        if ts:
+            await _schedule_start_ping(msg.id, interaction.channel, ts, "Secret Room")
         try:
-            msg = await _post_lineup(interaction.channel, interaction.guild, "Secret Room Line-Up", text or "", ping=ping_everyone)
-            ts  = _extract_unix(text or "") or _infer_local_time_unix(text or "")
-            if ts:
-                await _schedule_start_ping(msg.id, interaction.channel, ts, "Secret Room")
-        except Exception as e:
-            print(f"[WARN] secretroomlineup: {e}", flush=True)
-        await _safe_delete_original(interaction)
+            await interaction.followup.send("✅ Secret Room line-up posted.", ephemeral=True)
+        except Exception:
+            pass
 
+    # ── /status ───────────────────────────────────────────────────────────────
     @bot.slash_command(name="status", description="Show bot status", guild_ids=[GUILD_ID])
     async def status_slash(interaction: nextcord.Interaction):
         embed = nextcord.Embed(title="Bot Status", color=0x3498DB)
         embed.add_field(name="Uptime",  value=_format_uptime(),                inline=True)
         embed.add_field(name="Latency", value=f"{round(bot.latency*1000)} ms", inline=True)
         embed.add_field(name="Servers", value=str(len(bot.guilds)),             inline=True)
-        await _safe_respond(interaction, embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /nextffa ──────────────────────────────────────────────────────────────
     @bot.slash_command(name="nextffa", description="Show next FFA time (Asia/Manila)", guild_ids=[GUILD_ID])
     async def nextffa_slash(interaction: nextcord.Interaction):
         nt   = _next_ffa_local()
         unix = int(nt.astimezone(dt.timezone.utc).timestamp())
-        await _safe_respond(interaction, f"Next FFA: <t:{unix}:F> (<t:{unix}:R>) Asia/Manila", ephemeral=True)
+        await interaction.response.send_message(
+            f"Next FFA: <t:{unix}:F> (<t:{unix}:R>) Asia/Manila", ephemeral=True
+        )
 
+    # ── /wb ───────────────────────────────────────────────────────────────────
     @bot.slash_command(name="wb", description="Start a 2-hour World Boss timer", guild_ids=[GUILD_ID])
     async def wb_slash(
         interaction: nextcord.Interaction,
         boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
     ):
-        if not await _safe_defer(interaction, ephemeral=True):
-            return
+        await interaction.response.defer(ephemeral=True)
         now      = dt.datetime.now(dt.timezone.utc)
         end_unix = int((now + dt.timedelta(hours=2)).timestamp())
         raw      = (boss or "").strip().lower()
@@ -796,47 +687,48 @@ try:
 
         caller   = interaction.user.mention if interaction.user else "someone"
         barrier  = "──────────────────────────────"
-        msg_body = (
-            f"{barrier}\nHey team, Next World Boss (**{display}**) at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}"
-            if display else
-            f"{barrier}\nHey team, Next World Boss at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}"
-        )
+        msg_body = (f"{barrier}\nHey team, Next World Boss (**{display}**) at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}"
+                    if display else
+                    f"{barrier}\nHey team, Next World Boss at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}")
         try:
-            sent = await interaction.channel.send(
-                msg_body,
-                allowed_mentions=nextcord.AllowedMentions(everyone=False, roles=True, users=True)
-            )
+            sent = await interaction.channel.send(msg_body,
+                       allowed_mentions=nextcord.AllowedMentions(everyone=False, roles=True, users=True))
         except Exception:
-            await _safe_followup(interaction, "❌ Failed to post.")
+            await interaction.followup.send("❌ Failed to post.", ephemeral=True)
             return
 
         async def _end(start_id: int):
-            print(f"[WB] Timer started 2h for: {shout or 'unknown'}", flush=True)
+            try:
+                print(f"[WB] Timer started for 7200s (2h) for boss: {shout or 'None'}", flush=True)
+            except Exception:
+                pass
             await asyncio.sleep(7200)
             try:
                 await interaction.channel.fetch_message(start_id)
             except nextcord.errors.NotFound:
-                print(f"[WB] Cancelled: start message deleted.", flush=True)
+                try:
+                    print(f"[WB] Cancelled: start message {start_id} not found (deleted).", flush=True)
+                except Exception:
+                    pass
                 return
             except Exception:
                 pass
-            end_txt = (
-                f"{barrier}\n@everyone World Boss UP (**{shout}**)\n{barrier}"
-                if shout else
-                f"{barrier}\n@everyone World Boss UP\n{barrier}"
-            )
+            
+            end_txt = (f"{barrier}\n@everyone World Boss UP (**{shout}**)\n{barrier}" if shout else f"{barrier}\n@everyone World Boss UP\n{barrier}")
             try:
-                await interaction.channel.send(
-                    end_txt,
-                    allowed_mentions=nextcord.AllowedMentions(everyone=True, roles=True, users=True)
-                )
-                print(f"[WB] Announcement sent.", flush=True)
+                await interaction.channel.send(end_txt,
+                    allowed_mentions=nextcord.AllowedMentions(everyone=True, roles=True, users=True))
+                print(f"[WB] Announcement sent: {end_txt}", flush=True)
             except Exception as e:
-                print(f"[WB] Failed: {e}", flush=True)
+                print(f"[WB] Failed to send announcement: {e}", flush=True)
 
         asyncio.create_task(_end(sent.id))
-        await _safe_delete_original(interaction)
+        try:
+            await interaction.followup.send("✅ World Boss timer set.", ephemeral=True)
+        except Exception:
+            pass
 
+    # ── /cmds ─────────────────────────────────────────────────────────────────
     @bot.slash_command(name="cmds", description="List active slash commands", guild_ids=[GUILD_ID])
     async def cmds_slash(interaction: nextcord.Interaction):
         names: dict[str, str] = {}
@@ -851,20 +743,55 @@ try:
         except Exception:
             pass
         if not names:
-            await _safe_respond(interaction, "No commands found.")
+            await interaction.response.send_message("No commands found.", ephemeral=True)
             return
         lines = [f"/{n}" + (f" — {d}" if d else "") for n, d in sorted(names.items())]
-        await _safe_respond(interaction, "\n".join(lines), ephemeral=True)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 except Exception as _e:
     print(f"[WARN] Slash command setup failed: {_e}", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main entry  (no keepalive web server needed for Discloud)
+# Keepalive web server
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _start_keepalive():
+    try:
+        app = web.Application()
+
+        async def _health(request):
+            lines = ["OK", f"Bot: {'Online' if bot.is_ready() else BOT_STATUS.get('status','unknown')}"]
+            if BOT_STATUS.get("last_error"):
+                lines.append(f"Last Error: {BOT_STATUS['last_error']}")
+            return web.Response(text="\n".join(lines))
+
+        app.router.add_get("/",       _health)
+        app.router.add_get("/healthz", _health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port   = int(os.getenv("PORT", 10000))
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        print(f"[INFO] Keepalive server on port {port}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Keepalive failed: {e}", flush=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main entry — robust reconnect with Cloudflare-aware backoff
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CF_KEYWORDS = frozenset(["too many requests", "access denied", "cloudflare",
+                          "error 1015", "rate limited", "429", "<!doctype html>", "<html"])
+
+
+def _is_cloudflare(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(kw in msg for kw in CF_KEYWORDS)
+
+
 async def _main():
+    await _start_keepalive()
     attempt = 0
     while True:
         attempt += 1
@@ -872,25 +799,38 @@ async def _main():
             print(f"[INFO] Connecting to Discord (attempt {attempt})…", flush=True)
             BOT_STATUS["status"] = "connecting"
             await bot.start(TOKEN)
-            break
+            break  # clean exit
 
         except nextcord.errors.LoginFailure as e:
-            BOT_STATUS.update(
-                status="login_failure", last_error=str(e),
-                last_error_timestamp=str(dt.datetime.now())
-            )
+            BOT_STATUS.update(status="login_failure", last_error=str(e),
+                              last_error_timestamp=str(dt.datetime.now()))
             print(f"[ERROR] Login failed (bad token?): {e}", flush=True)
+            print("[INFO]  Retrying in 300 s…", flush=True)
             await asyncio.sleep(300)
 
         except Exception as e:
             short = str(e)[:200]
             BOT_STATUS.update(last_error=short, last_error_timestamp=str(dt.datetime.now()))
+
             if _is_cloudflare(e):
+                # Exponential-ish backoff: 1 h first time, up to 2 h, with jitter
                 delay = min(3600 * attempt, 7200) + random.randint(0, 300)
-                print(f"[WARN] Cloudflare 429 — waiting {delay // 60} min…", flush=True)
-                await asyncio.sleep(delay)
+                BOT_STATUS["status"] = f"cf_ratelimited_{delay}s"
+                print(f"\n[WARN] ⚠️  Cloudflare rate-limit (Error 1015/429).", flush=True)
+                print(f"[INFO]  Waiting {delay // 60} min before retrying…", flush=True)
+
+                # Countdown so health-check stays informative
+                remaining = delay
+                while remaining > 0:
+                    BOT_STATUS["status"] = f"cf_wait_{remaining}s"
+                    step = min(30, remaining)
+                    await asyncio.sleep(step)
+                    remaining -= step
+                    if remaining % 120 == 0 and remaining > 0:
+                        print(f"[WAIT] ⏳ {remaining // 60}m {remaining % 60}s remaining…", flush=True)
             else:
-                print(f"[ERROR] Unexpected: {e}", flush=True)
+                BOT_STATUS["status"] = "error_retry"
+                print(f"[ERROR] Unexpected error: {e}", flush=True)
                 await asyncio.sleep(min(60 * attempt, 300))
 
 
@@ -899,6 +839,7 @@ async def _main():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # ── Single-instance lock ──────────────────────────────────────────────────
     LOCK_FILE = os.path.join(os.path.dirname(__file__), "bot_instance.lock")
 
     def _rm_lock():
@@ -916,6 +857,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # ── Startup banner ────────────────────────────────────────────────────────
     safe = f"{TOKEN[:5]}…{TOKEN[-5:]}" if len(TOKEN) > 10 else "INVALID"
     print("\n" + "=" * 50, flush=True)
     print("[STARTING] Enhanced Event Bot", flush=True)
@@ -932,10 +874,12 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[STOP] Bot stopped by user.", flush=True)
     except Exception as e:
+        # Last-resort: if we somehow bubble out, sleep before letting the
+        # process manager restart us (breaks crash-restart loops on Render).
         if _is_cloudflare(e):
-            print(f"[ERROR] CF ban at top level — sleeping 3600s…", flush=True)
+            print(f"\n[ERROR] CF ban at top level — sleeping 3600 s before exit…", flush=True)
             time.sleep(3600)
         else:
-            print(f"[ERROR] Fatal: {e}", flush=True)
+            print(f"\n[ERROR] Fatal: {e}", flush=True)
             time.sleep(60)
         sys.exit(1)
