@@ -277,15 +277,11 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
     when  = dt.datetime.fromtimestamp(when_unix, tz=dt.timezone.utc)
     delay = (when - now).total_seconds()
 
-    async def _ping():
-        if delay > 0:
-            await asyncio.sleep(delay)
-        
+    async def _get_join_ids() -> list[int]:
+        """Fetch the current joiner list from in-memory state + live reactions."""
         join_ids: set[int] = set()
-        
         state = lineups.get(message_id, {})
         join_ids.update(state.get("join", set()))
-
         try:
             msg = await channel.fetch_message(message_id)
             for reaction in msg.reactions:
@@ -298,18 +294,36 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
                         join_ids.discard(user.id)
         except Exception as e:
             print(f"[PING] Could not fetch live reactions for {message_id}: {e}", flush=True)
+        return list(join_ids)
 
-        user_list = list(join_ids)
+    async def _send_mention(user_list: list[int], text: str):
         allowed = nextcord.AllowedMentions(everyone=False, roles=False, users=True)
         if user_list:
             for i in range(0, len(user_list), 50):
                 mentions = " ".join(f"<@{uid}>" for uid in user_list[i:i+50])
-                await channel.send(
-                    f"{mentions}\nGear up, stay online, and get ready! ⚔️",
-                    allowed_mentions=allowed
-                )
+                await channel.send(f"{mentions}\n{text}", allowed_mentions=allowed)
         else:
-            await channel.send("Gear up, stay online, and get ready! ⚔️")
+            await channel.send(text)
+
+    async def _ping():
+        # ── 15-minute early warning ──────────────────────────────────────────
+        early_delay = delay - 15 * 60  # 15 mins before event
+        if early_delay > 0:
+            await asyncio.sleep(early_delay)
+            user_list = await _get_join_ids()
+            await _send_mention(
+                user_list,
+                f"⚔️ **{event_name}** starts in **15 minutes**! Get ready and stay online!"
+            )
+            # Wait the remaining 15 minutes
+            await asyncio.sleep(15 * 60)
+        elif delay > 0:
+            # Less than 15 mins left — skip the early ping, just wait for start
+            await asyncio.sleep(delay)
+
+        # ── At-event ping ────────────────────────────────────────────────────
+        user_list = await _get_join_ids()
+        await _send_mention(user_list, "Gear up, stay online, and get ready! ⚔️")
 
     asyncio.create_task(_ping())
 
