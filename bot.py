@@ -204,7 +204,9 @@ def _parse_event_time_unix(text: str) -> int | None:
 # Lineup helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set, text: str = "") -> nextcord.Embed:
+def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set, text: str = "", reserve_ids: set = None) -> nextcord.Embed:
+    is_secret     = "secret room" in title.lower()
+    reserve_ids   = reserve_ids or set()
     embed = nextcord.Embed(title=f"⚔ {title} ⚔", color=0x2ECC71)
     if text:
         embed.description = text
@@ -220,30 +222,41 @@ def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set,
 
     embed.add_field(name=f"✅ Will Join ({len(join_ids)})",   value=names(join_ids), inline=True)
     embed.add_field(name=f"❌ Not Joining ({len(no_ids)})", value=names(no_ids),  inline=True)
-    embed.set_footer(text="React ✅ or ❌ to update your participation")
+    if is_secret:
+        embed.add_field(name=f"♿ Reserve ({len(reserve_ids)})", value=names(reserve_ids), inline=True)
+    footer = "React ✅ or ❌ to update your participation"
+    if is_secret:
+        footer = "React ✅, ❌, or ♿ to update your participation"
+    embed.set_footer(text=footer)
     return embed
 
 
 async def _post_lineup(channel, guild, title: str, text: str = "", ping: bool = False) -> nextcord.Message:
-    join_ids: set[int] = set()
-    no_ids:   set[int] = set()
-    embed   = _lineup_embed(title, guild, join_ids, no_ids, text)
+    join_ids:    set[int] = set()
+    no_ids:      set[int] = set()
+    reserve_ids: set[int] = set()
+    is_secret = "secret room" in title.lower()
+    embed   = _lineup_embed(title, guild, join_ids, no_ids, text, reserve_ids if is_secret else None)
     allowed = nextcord.AllowedMentions(everyone=ping, roles=True, users=True)
     content = "@everyone" if ping else None
     msg     = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
     try:
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
+        if is_secret:
+            await msg.add_reaction("♿")
     except Exception:
         pass
-    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text}
+    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text, "reserve": reserve_ids, "is_secret": is_secret}
     return msg
 
 
 async def _post_lineup_interaction(interaction: nextcord.Interaction, title: str, text: str = "", ping: bool = False) -> nextcord.Message:
-    join_ids: set[int] = set()
-    no_ids:   set[int] = set()
-    embed   = _lineup_embed(title, interaction.guild, join_ids, no_ids, text)
+    join_ids:    set[int] = set()
+    no_ids:      set[int] = set()
+    reserve_ids: set[int] = set()
+    is_secret = "secret room" in title.lower()
+    embed   = _lineup_embed(title, interaction.guild, join_ids, no_ids, text, reserve_ids if is_secret else None)
     allowed = nextcord.AllowedMentions(everyone=ping, roles=True, users=True)
     content = "@everyone" if ping else None
     await interaction.response.send_message(content=content, embed=embed, allowed_mentions=allowed)
@@ -251,9 +264,11 @@ async def _post_lineup_interaction(interaction: nextcord.Interaction, title: str
     try:
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
+        if is_secret:
+            await msg.add_reaction("♿")
     except Exception:
         pass
-    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text}
+    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text, "reserve": reserve_ids, "is_secret": is_secret}
     return msg
 
 
@@ -443,15 +458,22 @@ async def on_reaction_add(reaction: nextcord.Reaction, user: nextcord.User):
     emoji = str(reaction.emoji)
     if emoji == "✅":
         state["no"].discard(user.id)
+        state["reserve"].discard(user.id)
         state["join"].add(user.id)
     elif emoji == "❌":
         state["join"].discard(user.id)
+        state["reserve"].discard(user.id)
         state["no"].add(user.id)
+    elif emoji == "♿" and state.get("is_secret"):
+        state["join"].discard(user.id)
+        state["no"].discard(user.id)
+        state["reserve"].add(user.id)
     else:
         return
     try:
         title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
-        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""))
+        reserve_ids = state["reserve"] if state.get("is_secret") else None
+        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
         await reaction.message.edit(embed=embed)
     except Exception:
         pass
@@ -470,11 +492,14 @@ async def on_reaction_remove(reaction: nextcord.Reaction, user: nextcord.User):
         state["join"].discard(user.id)
     elif emoji == "❌":
         state["no"].discard(user.id)
+    elif emoji == "♿":
+        state["reserve"].discard(user.id)
     else:
         return
     try:
         title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
-        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""))
+        reserve_ids = state["reserve"] if state.get("is_secret") else None
+        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
         await reaction.message.edit(embed=embed)
     except Exception:
         pass
