@@ -106,6 +106,7 @@ lineups: dict[int, dict] = {}
 
 # Bot health state
 BOT_STATUS: dict = {"status": "initializing", "last_error": None, "last_error_timestamp": None}
+CONNECT_ATTEMPT: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -384,9 +385,10 @@ async def _scheduler():
 
 @bot.event
 async def on_ready():
-    global START_TIME, ANNOUNCE_TASK
+    global START_TIME, ANNOUNCE_TASK, CONNECT_ATTEMPT
     START_TIME = dt.datetime.now(dt.timezone.utc)
     BOT_STATUS["status"] = "online"
+    CONNECT_ATTEMPT = 0  # Reset counter on successful connection
 
     print("\n" + "=" * 50, flush=True)
     print(f"[OK] Logged in as {bot.user} (ID: {bot.user.id})", flush=True)
@@ -889,6 +891,23 @@ async def _start_keepalive():
         port   = int(os.getenv("PORT", 10000))
         await web.TCPSite(runner, "0.0.0.0", port).start()
         print(f"[INFO] Keepalive server on port {port}", flush=True)
+
+        ext_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("HOST_URL")
+        if ext_url:
+            async def _self_ping():
+                ping_url = f"{ext_url.rstrip('/')}/healthz"
+                print(f"[INFO] Self-ping active for {ping_url}", flush=True)
+                import aiohttp
+                while True:
+                    await asyncio.sleep(600)  # Ping every 10 minutes
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(ping_url) as resp:
+                                pass
+                    except Exception as e:
+                        print(f"[PING] Self-ping error: {e}", flush=True)
+
+            asyncio.create_task(_self_ping())
     except Exception as e:
         print(f"[ERROR] Keepalive failed: {e}", flush=True)
 
@@ -907,10 +926,17 @@ def _is_cloudflare(exc: Exception) -> bool:
 
 
 async def _main():
+    global CONNECT_ATTEMPT
     await _start_keepalive()
-    attempt = 0
+    if not TOKEN:
+        BOT_STATUS["status"] = "missing_token"
+        print("[ERROR] ❌ No DISCORD_TOKEN set! Set DISCORD_TOKEN env var or bot_token.txt", flush=True)
+        while True:
+            await asyncio.sleep(3600)
+
     while True:
-        attempt += 1
+        CONNECT_ATTEMPT += 1
+        attempt = CONNECT_ATTEMPT
         try:
             print(f"[INFO] Connecting to Discord (attempt {attempt})…", flush=True)
             BOT_STATUS["status"] = "connecting"
@@ -929,8 +955,8 @@ async def _main():
             BOT_STATUS.update(last_error=short, last_error_timestamp=str(dt.datetime.now()))
 
             if _is_cloudflare(e):
-                # Exponential-ish backoff: 1 h first time, up to 2 h, with jitter
-                delay = min(3600 * attempt, 7200) + random.randint(0, 300)
+                # Backoff: 5 min base delay, up to 30 min max, with jitter
+                delay = min(300 * attempt, 1800) + random.randint(0, 120)
                 BOT_STATUS["status"] = f"cf_ratelimited_{delay}s"
                 print(f"\n[WARN] ⚠️  Cloudflare rate-limit (Error 1015/429).", flush=True)
                 print(f"[INFO]  Waiting {delay // 60} min before retrying…", flush=True)
@@ -982,8 +1008,7 @@ if __name__ == "__main__":
     print("=" * 50 + "\n", flush=True)
 
     if not TOKEN:
-        print("[ERROR] ❌ No token found! Set DISCORD_TOKEN env var or bot_token.txt", flush=True)
-        sys.exit(1)
+        print("[WARN] ⚠ DISCORD_TOKEN is missing! Web keepalive server will start, but bot cannot connect until set.", flush=True)
 
     try:
         asyncio.run(_main())
