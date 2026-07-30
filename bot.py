@@ -315,15 +315,6 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
                 user_list,
                 f"⚔️ **{event_name}** starts in **15 minutes**! Get ready and stay online!"
             )
-            # Wait the remaining 15 minutes
-            await asyncio.sleep(15 * 60)
-        elif delay > 0:
-            # Less than 15 mins left — skip the early ping, just wait for start
-            await asyncio.sleep(delay)
-
-        # ── At-event ping ────────────────────────────────────────────────────
-        user_list = await _get_join_ids()
-        await _send_mention(user_list, "Gear up, stay online, and get ready! ⚔️")
 
     asyncio.create_task(_ping())
 
@@ -417,6 +408,8 @@ async def on_ready():
     global START_TIME, ANNOUNCE_TASK, CONNECT_ATTEMPT
     START_TIME = dt.datetime.now(dt.timezone.utc)
     BOT_STATUS["status"] = "online"
+    BOT_STATUS["last_error"] = None          # Clear any previous login error
+    BOT_STATUS["last_error_timestamp"] = None
     CONNECT_ATTEMPT = 0  # Reset counter on successful connection
 
     print("\n" + "=" * 50, flush=True)
