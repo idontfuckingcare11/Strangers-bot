@@ -918,10 +918,16 @@ async def _start_keepalive():
         app = web.Application()
 
         async def _health(request):
-            lines = ["OK", f"Bot: {'Online' if bot.is_ready() else BOT_STATUS.get('status','unknown')}"]
+            status = BOT_STATUS.get("status", "unknown")
+            is_healthy = bot.is_ready()
+            lines = [
+                "OK" if is_healthy else "ERROR",
+                f"Bot: {'Online' if is_healthy else status}",
+            ]
             if BOT_STATUS.get("last_error"):
                 lines.append(f"Last Error: {BOT_STATUS['last_error']}")
-            return web.Response(text="\n".join(lines))
+            http_status = 200 if is_healthy else 503
+            return web.Response(text="\n".join(lines), status=http_status)
 
         app.router.add_get("/",       _health)
         app.router.add_get("/healthz", _health)
@@ -938,7 +944,7 @@ async def _start_keepalive():
                 print(f"[INFO] Self-ping active for {ping_url}", flush=True)
                 import aiohttp
                 while True:
-                    await asyncio.sleep(600)  # Ping every 10 minutes
+                    await asyncio.sleep(240)  # Ping every 4 minutes to prevent Render spin-down
                     try:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(ping_url) as resp:
