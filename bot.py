@@ -204,7 +204,9 @@ def _parse_event_time_unix(text: str) -> int | None:
 # Lineup helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set, text: str = "") -> nextcord.Embed:
+def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set, text: str = "", reserve_ids: set = None) -> nextcord.Embed:
+    is_secret     = "secret room" in title.lower()
+    reserve_ids   = reserve_ids or set()
     embed = nextcord.Embed(title=f"⚔ {title} ⚔", color=0x2ECC71)
     if text:
         embed.description = text
@@ -220,30 +222,41 @@ def _lineup_embed(title: str, guild: nextcord.Guild, join_ids: set, no_ids: set,
 
     embed.add_field(name=f"✅ Will Join ({len(join_ids)})",   value=names(join_ids), inline=True)
     embed.add_field(name=f"❌ Not Joining ({len(no_ids)})", value=names(no_ids),  inline=True)
-    embed.set_footer(text="React ✅ or ❌ to update your participation")
+    if is_secret:
+        embed.add_field(name=f"♿ Reserve ({len(reserve_ids)})", value=names(reserve_ids), inline=True)
+    footer = "React ✅ or ❌ to update your participation"
+    if is_secret:
+        footer = "React ✅, ❌, or ♿ to update your participation"
+    embed.set_footer(text=footer)
     return embed
 
 
 async def _post_lineup(channel, guild, title: str, text: str = "", ping: bool = False) -> nextcord.Message:
-    join_ids: set[int] = set()
-    no_ids:   set[int] = set()
-    embed   = _lineup_embed(title, guild, join_ids, no_ids, text)
+    join_ids:    set[int] = set()
+    no_ids:      set[int] = set()
+    reserve_ids: set[int] = set()
+    is_secret = "secret room" in title.lower()
+    embed   = _lineup_embed(title, guild, join_ids, no_ids, text, reserve_ids if is_secret else None)
     allowed = nextcord.AllowedMentions(everyone=ping, roles=True, users=True)
     content = "@everyone" if ping else None
     msg     = await channel.send(content=content, embed=embed, allowed_mentions=allowed)
     try:
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
+        if is_secret:
+            await msg.add_reaction("♿")
     except Exception:
         pass
-    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text}
+    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text, "reserve": reserve_ids, "is_secret": is_secret}
     return msg
 
 
 async def _post_lineup_interaction(interaction: nextcord.Interaction, title: str, text: str = "", ping: bool = False) -> nextcord.Message:
-    join_ids: set[int] = set()
-    no_ids:   set[int] = set()
-    embed   = _lineup_embed(title, interaction.guild, join_ids, no_ids, text)
+    join_ids:    set[int] = set()
+    no_ids:      set[int] = set()
+    reserve_ids: set[int] = set()
+    is_secret = "secret room" in title.lower()
+    embed   = _lineup_embed(title, interaction.guild, join_ids, no_ids, text, reserve_ids if is_secret else None)
     allowed = nextcord.AllowedMentions(everyone=ping, roles=True, users=True)
     content = "@everyone" if ping else None
     await interaction.response.send_message(content=content, embed=embed, allowed_mentions=allowed)
@@ -251,9 +264,11 @@ async def _post_lineup_interaction(interaction: nextcord.Interaction, title: str
     try:
         await msg.add_reaction("✅")
         await msg.add_reaction("❌")
+        if is_secret:
+            await msg.add_reaction("♿")
     except Exception:
         pass
-    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text}
+    lineups[msg.id] = {"join": join_ids, "no": no_ids, "text": text, "reserve": reserve_ids, "is_secret": is_secret}
     return msg
 
 
@@ -262,15 +277,11 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
     when  = dt.datetime.fromtimestamp(when_unix, tz=dt.timezone.utc)
     delay = (when - now).total_seconds()
 
-    async def _ping():
-        if delay > 0:
-            await asyncio.sleep(delay)
-        
+    async def _get_join_ids() -> list[int]:
+        """Fetch the current joiner list from in-memory state + live reactions."""
         join_ids: set[int] = set()
-        
         state = lineups.get(message_id, {})
         join_ids.update(state.get("join", set()))
-
         try:
             msg = await channel.fetch_message(message_id)
             for reaction in msg.reactions:
@@ -283,18 +294,36 @@ async def _schedule_start_ping(message_id: int, channel, when_unix: int, event_n
                         join_ids.discard(user.id)
         except Exception as e:
             print(f"[PING] Could not fetch live reactions for {message_id}: {e}", flush=True)
+        return list(join_ids)
 
-        user_list = list(join_ids)
+    async def _send_mention(user_list: list[int], text: str):
         allowed = nextcord.AllowedMentions(everyone=False, roles=False, users=True)
         if user_list:
             for i in range(0, len(user_list), 50):
                 mentions = " ".join(f"<@{uid}>" for uid in user_list[i:i+50])
-                await channel.send(
-                    f"{mentions}\nGear up, stay online, and get ready! ⚔️",
-                    allowed_mentions=allowed
-                )
+                await channel.send(f"{mentions}\n{text}", allowed_mentions=allowed)
         else:
-            await channel.send("Gear up, stay online, and get ready! ⚔️")
+            await channel.send(text)
+
+    async def _ping():
+        # ── 15-minute early warning ──────────────────────────────────────────
+        early_delay = delay - 15 * 60  # 15 mins before event
+        if early_delay > 0:
+            await asyncio.sleep(early_delay)
+            user_list = await _get_join_ids()
+            await _send_mention(
+                user_list,
+                f"⚔️ **{event_name}** starts in **15 minutes**! Get ready and stay online!"
+            )
+            # Wait the remaining 15 minutes
+            await asyncio.sleep(15 * 60)
+        elif delay > 0:
+            # Less than 15 mins left — skip the early ping, just wait for start
+            await asyncio.sleep(delay)
+
+        # ── At-event ping ────────────────────────────────────────────────────
+        user_list = await _get_join_ids()
+        await _send_mention(user_list, "Gear up, stay online, and get ready! ⚔️")
 
     asyncio.create_task(_ping())
 
@@ -443,15 +472,22 @@ async def on_reaction_add(reaction: nextcord.Reaction, user: nextcord.User):
     emoji = str(reaction.emoji)
     if emoji == "✅":
         state["no"].discard(user.id)
+        state["reserve"].discard(user.id)
         state["join"].add(user.id)
     elif emoji == "❌":
         state["join"].discard(user.id)
+        state["reserve"].discard(user.id)
         state["no"].add(user.id)
+    elif emoji == "♿" and state.get("is_secret"):
+        state["join"].discard(user.id)
+        state["no"].discard(user.id)
+        state["reserve"].add(user.id)
     else:
         return
     try:
         title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
-        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""))
+        reserve_ids = state["reserve"] if state.get("is_secret") else None
+        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
         await reaction.message.edit(embed=embed)
     except Exception:
         pass
@@ -470,11 +506,14 @@ async def on_reaction_remove(reaction: nextcord.Reaction, user: nextcord.User):
         state["join"].discard(user.id)
     elif emoji == "❌":
         state["no"].discard(user.id)
+    elif emoji == "♿":
+        state["reserve"].discard(user.id)
     else:
         return
     try:
         title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
-        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""))
+        reserve_ids = state["reserve"] if state.get("is_secret") else None
+        embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
         await reaction.message.edit(embed=embed)
     except Exception:
         pass
@@ -879,10 +918,16 @@ async def _start_keepalive():
         app = web.Application()
 
         async def _health(request):
-            lines = ["OK", f"Bot: {'Online' if bot.is_ready() else BOT_STATUS.get('status','unknown')}"]
+            status = BOT_STATUS.get("status", "unknown")
+            is_healthy = bot.is_ready()
+            lines = [
+                "OK" if is_healthy else "ERROR",
+                f"Bot: {'Online' if is_healthy else status}",
+            ]
             if BOT_STATUS.get("last_error"):
                 lines.append(f"Last Error: {BOT_STATUS['last_error']}")
-            return web.Response(text="\n".join(lines))
+            http_status = 200 if is_healthy else 503
+            return web.Response(text="\n".join(lines), status=http_status)
 
         app.router.add_get("/",       _health)
         app.router.add_get("/healthz", _health)
@@ -899,7 +944,7 @@ async def _start_keepalive():
                 print(f"[INFO] Self-ping active for {ping_url}", flush=True)
                 import aiohttp
                 while True:
-                    await asyncio.sleep(600)  # Ping every 10 minutes
+                    await asyncio.sleep(240)  # Ping every 4 minutes to prevent Render spin-down
                     try:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(ping_url) as resp:
