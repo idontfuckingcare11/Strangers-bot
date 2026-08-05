@@ -63,6 +63,7 @@ PH_TZ    = ZoneInfo("Asia/Manila")
 FFA_TIMES = [11, 14, 17, 20, 23, 2, 5, 8]
 
 # ── Event schedules ───────────────────────────────────────────────────────────
+# weekday: 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri 5=Sat 6=Sun  (None = every day)
 EVENT_SCHEDULES = [
     {
         "name": "Crystal Mines",
@@ -78,15 +79,40 @@ EVENT_SCHEDULES = [
         "times": [(10, 0, None), (20, 0, None), (4, 0, None)],
         "offset_mins": 5,
     },
+    # ── Guild Siege ────────────────────────────────────────────────────────────
+    # Weekdays (Mon–Fri): 8 PM event → lineup at 6 PM
+    # Sat & Sun:         10 PM event → lineup at 8 PM
+    {
+        "name": "Guild Siege",
+        "channel": SIEGE_CHANNEL_ID,
+        "message": "⚔️ **Guild Siege** starts {time_tag}!\n\nGuild Siege in 2 hours",
+        "times": [
+            (20, 0, 0),   # Monday    8 PM
+            (20, 0, 1),   # Tuesday   8 PM
+            (20, 0, 2),   # Wednesday 8 PM
+            (20, 0, 3),   # Thursday  8 PM
+            (20, 0, 4),   # Friday    8 PM
+            (22, 0, 5),   # Saturday  10 PM
+            (22, 0, 6),   # Sunday    10 PM
+        ],
+        "offset_mins": 120,         # announce 2 hrs before
+        "lineup": True,
+        "ping": True,
+    },
+    # ── Secret Room ────────────────────────────────────────────────────────────
+    # Wednesday 11 PM → announce at 7 PM  |  Sunday 8 PM → announce at 4 PM
     {
         "name": "Secret Room",
-        "channel": SECRET_ROOM_EVENT_CH_ID,
-        "message": "🗝️ **Secret Room** starts {time_tag}!",
-        "times": [(21, 0, 5)],
-        "offset_mins": 30,
+        "channel": SECRET_ROOM_CHANNEL_ID,
+        "message": "🗝️ **Secret Room** starts {time_tag}!\n\nSecret Room in 4 hours",
+        "times": [
+            (23, 0, 2),   # Wednesday 11 PM PH
+            (20, 0, 6),   # Sunday    8 PM PH
+        ],
+        "offset_mins": 240,         # announce 4 hrs before
         "lineup": True,
-        "at_start": True,
-        "start_message": "🗝️ **Secret Room** has started! Join now! @everyone",
+        "ping": True,
+        "is_secret": True,
     },
 ]
 
@@ -380,8 +406,14 @@ async def _scheduler():
                         ts      = int(next_action["event_time"].timestamp())
                         tag     = f"<t:{ts}:R>"
                         msg_txt = ev["message"].format(time_tag=tag)
+                        do_ping = ev.get("ping", False)
                         if ev.get("lineup"):
-                            msg = await _post_lineup(channel, channel.guild, f"{ev['name']} Line-Up", msg_txt, ping=True)
+                            # Use "Secret Room Line-Up" title for secret events so ♿ appears
+                            if ev.get("is_secret"):
+                                lineup_title = "Secret Room Line-Up"
+                            else:
+                                lineup_title = f"{ev['name']} Line-Up"
+                            msg = await _post_lineup(channel, channel.guild, lineup_title, msg_txt, ping=do_ping)
                             await _schedule_start_ping(msg.id, channel, ts, ev["name"])
                         else:
                             await channel.send(msg_txt, allowed_mentions=allowed)
@@ -454,60 +486,138 @@ async def on_command_error(ctx: commands.Context, error: Exception):
         pass
 
 
+async def _rebuild_lineup_from_reactions(message: nextcord.Message) -> dict:
+    """Re-build lineup state by reading live reactions off the message."""
+    join_ids:    set[int] = set()
+    no_ids:      set[int] = set()
+    reserve_ids: set[int] = set()
+    is_secret = False
+    if message.embeds:
+        title_raw = message.embeds[0].title or ""
+        is_secret = "secret room" in title_raw.lower()
+        # Try to recover stored text from embed description
+    text = ""
+    if message.embeds and message.embeds[0].description:
+        text = message.embeds[0].description
+    for reaction in message.reactions:
+        emoji = str(reaction.emoji)
+        async for u in reaction.users():
+            if u.bot:
+                continue
+            if emoji == "✅":
+                join_ids.add(u.id)
+            elif emoji == "❌":
+                no_ids.add(u.id)
+            elif emoji == "♿":
+                reserve_ids.add(u.id)
+    # A user can only be in one bucket — last emoji wins (✅ > ❌ > ♿)
+    # Discord only stores one reaction per user per emoji, so conflicts
+    # are resolved by discarding from the other buckets.
+    for uid in list(join_ids):
+        no_ids.discard(uid)
+        reserve_ids.discard(uid)
+    for uid in list(no_ids):
+        reserve_ids.discard(uid)
+    state = {"join": join_ids, "no": no_ids, "reserve": reserve_ids,
+             "text": text, "is_secret": is_secret}
+    lineups[message.id] = state
+    return state
+
+
 @bot.event
-async def on_reaction_add(reaction: nextcord.Reaction, user: nextcord.User):
-    if user.bot or reaction.message.id not in lineups:
+async def on_raw_reaction_add(payload: nextcord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
         return
-    guild = reaction.message.guild
+    emoji = str(payload.emoji)
+    if emoji not in ("✅", "❌", "♿"):
+        return
+
+    guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
-    state = lineups[reaction.message.id]
-    emoji = str(reaction.emoji)
+    channel = guild.get_channel(payload.channel_id)
+    if not channel:
+        return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except Exception:
+        return
+
+    # Only handle lineup messages (must have our embed footer)
+    if not message.embeds:
+        return
+    footer = (message.embeds[0].footer.text or "") if message.embeds[0].footer else ""
+    if "React" not in footer:
+        return
+
+    if payload.message_id not in lineups:
+        await _rebuild_lineup_from_reactions(message)
+
+    state = lineups[payload.message_id]
+    uid   = payload.user_id
+
     if emoji == "✅":
-        state["no"].discard(user.id)
-        state["reserve"].discard(user.id)
-        state["join"].add(user.id)
+        state["no"].discard(uid)
+        state["reserve"].discard(uid)
+        state["join"].add(uid)
     elif emoji == "❌":
-        state["join"].discard(user.id)
-        state["reserve"].discard(user.id)
-        state["no"].add(user.id)
+        state["join"].discard(uid)
+        state["reserve"].discard(uid)
+        state["no"].add(uid)
     elif emoji == "♿" and state.get("is_secret"):
-        state["join"].discard(user.id)
-        state["no"].discard(user.id)
-        state["reserve"].add(user.id)
+        state["join"].discard(uid)
+        state["no"].discard(uid)
+        state["reserve"].add(uid)
     else:
         return
+
     try:
-        title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
+        title_raw = message.embeds[0].title or "Line-Up"
+        title = title_raw.replace("⚔ ", "").replace(" ⚔", "")
         reserve_ids = state["reserve"] if state.get("is_secret") else None
         embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
-        await reaction.message.edit(embed=embed)
+        await message.edit(embed=embed)
     except Exception:
         pass
 
 
 @bot.event
-async def on_reaction_remove(reaction: nextcord.Reaction, user: nextcord.User):
-    if user.bot or reaction.message.id not in lineups:
+async def on_raw_reaction_remove(payload: nextcord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
         return
-    guild = reaction.message.guild
+    emoji = str(payload.emoji)
+    if emoji not in ("✅", "❌", "♿"):
+        return
+
+    guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
-    state = lineups[reaction.message.id]
-    emoji = str(reaction.emoji)
-    if emoji == "✅":
-        state["join"].discard(user.id)
-    elif emoji == "❌":
-        state["no"].discard(user.id)
-    elif emoji == "♿":
-        state["reserve"].discard(user.id)
-    else:
+    channel = guild.get_channel(payload.channel_id)
+    if not channel:
         return
+
     try:
-        title = reaction.message.embeds[0].title.replace("⚔ ", "").replace(" ⚔", "") if reaction.message.embeds else "Line-Up"
+        message = await channel.fetch_message(payload.message_id)
+    except Exception:
+        return
+
+    # Only handle lineup messages
+    if not message.embeds:
+        return
+    footer = (message.embeds[0].footer.text or "") if message.embeds[0].footer else ""
+    if "React" not in footer:
+        return
+
+    # Always rebuild from live reactions on remove — this is the most accurate
+    state = await _rebuild_lineup_from_reactions(message)
+
+    try:
+        title_raw = message.embeds[0].title or "Line-Up"
+        title = title_raw.replace("⚔ ", "").replace(" ⚔", "")
         reserve_ids = state["reserve"] if state.get("is_secret") else None
         embed = _lineup_embed(title, guild, state["join"], state["no"], state.get("text", ""), reserve_ids)
-        await reaction.message.edit(embed=embed)
+        await message.edit(embed=embed)
     except Exception:
         pass
 
