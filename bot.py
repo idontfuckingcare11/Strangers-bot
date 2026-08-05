@@ -93,21 +93,21 @@ EVENT_SCHEDULES = [
             (20, 0, 3),   # Thursday  8 PM
             (20, 0, 4),   # Friday    8 PM
             (22, 0, 5),   # Saturday  10 PM
-            (22, 0, 6),   # Sunday    10 PM
+            (23, 0, 6),   # Sunday    11 PM
         ],
         "offset_mins": 120,         # announce 2 hrs before
         "lineup": True,
         "ping": True,
     },
     # ── Secret Room ────────────────────────────────────────────────────────────
-    # Wednesday 11 PM → announce at 7 PM  |  Sunday 8 PM → announce at 4 PM
+    # Wednesday 11 PM → announce at 7 PM  |  Sunday 9 PM → announce at 5 PM  (all PH time)
     {
         "name": "Secret Room",
         "channel": SECRET_ROOM_CHANNEL_ID,
         "message": "🗝️ **Secret Room** starts {time_tag}!\n\nSecret Room in 4 hours",
         "times": [
             (23, 0, 2),   # Wednesday 11 PM PH
-            (20, 0, 6),   # Sunday    8 PM PH
+            (21, 0, 6),   # Sunday     9 PM PH
         ],
         "offset_mins": 240,         # announce 4 hrs before
         "lineup": True,
