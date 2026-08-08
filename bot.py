@@ -978,11 +978,8 @@ try:
 
     # ── /worldboss ────────────────────────────────────────────────────────────
     @bot.slash_command(name="worldboss", description="Announce next world boss (in 2 hours)", guild_ids=[GUILD_ID])
-    async def worldboss_slash(
-        interaction: nextcord.Interaction,
-        boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
-    ):
-        await _start_world_boss(interaction, boss)
+    async def worldboss_slash(interaction: nextcord.Interaction):
+        await _start_world_boss(interaction)
 
     # ── /cmds ─────────────────────────────────────────────────────────────────
     @bot.slash_command(name="cmds", description="List active slash commands", guild_ids=[GUILD_ID])
