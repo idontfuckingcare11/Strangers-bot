@@ -917,12 +917,8 @@ try:
             f"Next FFA: <t:{unix}:F> (<t:{unix}:R>) Asia/Manila", ephemeral=True
         )
 
-    # ── /wb ───────────────────────────────────────────────────────────────────
-    @bot.slash_command(name="wb", description="Start a 2-hour World Boss timer", guild_ids=[GUILD_ID])
-    async def wb_slash(
-        interaction: nextcord.Interaction,
-        boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
-    ):
+    # ── World Boss helper ─────────────────────────────────────────────────────
+    async def _start_world_boss(interaction: nextcord.Interaction, boss: str = ""):
         now      = dt.datetime.now(dt.timezone.utc)
         end_unix = int((now + dt.timedelta(hours=2)).timestamp())
         raw      = (boss or "").strip().lower()
@@ -941,7 +937,7 @@ try:
         msg_body = (f"{barrier}\nHey team, Next World Boss (**{display}**) at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}"
                     if display else
                     f"{barrier}\nHey team, Next World Boss at <t:{end_unix}:t>.\nCalled by: {caller}\n{barrier}")
-        
+
         await interaction.response.send_message(msg_body, allowed_mentions=nextcord.AllowedMentions(everyone=False, roles=True, users=True))
         sent = await interaction.original_message()
 
@@ -961,7 +957,7 @@ try:
                 return
             except Exception:
                 pass
-            
+
             end_txt = (f"{barrier}\n@everyone World Boss UP (**{shout}**)\n{barrier}" if shout else f"{barrier}\n@everyone World Boss UP\n{barrier}")
             try:
                 await interaction.channel.send(end_txt,
@@ -971,6 +967,22 @@ try:
                 print(f"[WB] Failed to send announcement: {e}", flush=True)
 
         asyncio.create_task(_end(sent.id))
+
+    # ── /wb ───────────────────────────────────────────────────────────────────
+    @bot.slash_command(name="wb", description="Start a 2-hour World Boss timer", guild_ids=[GUILD_ID])
+    async def wb_slash(
+        interaction: nextcord.Interaction,
+        boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
+    ):
+        await _start_world_boss(interaction, boss)
+
+    # ── /worldboss ────────────────────────────────────────────────────────────
+    @bot.slash_command(name="worldboss", description="Announce next world boss (in 2 hours)", guild_ids=[GUILD_ID])
+    async def worldboss_slash(
+        interaction: nextcord.Interaction,
+        boss: str = SlashOption(required=False, description="Boss name e.g. Nihilus / Zadkiel"),
+    ):
+        await _start_world_boss(interaction, boss)
 
     # ── /cmds ─────────────────────────────────────────────────────────────────
     @bot.slash_command(name="cmds", description="List active slash commands", guild_ids=[GUILD_ID])
